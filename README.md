@@ -14,6 +14,7 @@ A minimal 32-bit operating system written from scratch in assembly.
   - `help` — show available commands
   - `clear` — clear the screen
   - `conclusion "text"` — print text in quotes
+  - `ver` - version of Ventura
 
 ## Building
 
@@ -31,7 +32,6 @@ qemu-system-i386 -drive format=raw,file=os.img
 |------|-------------|
 | `boot.asm` | Bootloader (512 bytes): A20 gate, GDT, 32-bit switch, loads kernel |
 | `kernel.asm` | Kernel: VGA driver, keyboard driver, command parser |
-| `build.py` | Build script: compiles and links boot + kernel into os.img |
 
 ## How It Works
 
