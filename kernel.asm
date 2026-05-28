@@ -63,7 +63,12 @@ kernel_start:
     mov ecx, 5
     repe cmpsb
     je .run_help
-
+    ; === ver ===
+    mov esi, input
+    mov edi, cmd_ver
+    mov ecx, 4
+    repe cmpsb
+    je .ver
     ; === clear ===
     mov esi, input
     mov edi, cmd_clear
@@ -80,6 +85,13 @@ kernel_start:
 
     pop edi
     jmp .unknown
+.ver:
+    pop edi
+    call embe32_help
+    db 3, "Ventura", 2, "OS V1.3B", 10
+    db 1, "Created:", 10, "  Many commands", 10, "  Colors", 10
+    db 0
+    jmp .done_cmd
 
 .run_help:
     pop edi
@@ -266,6 +278,8 @@ embe32:
     db 2, "  conclusion", 1, ' "text" - print text', 10
     db 0
     ret
+
+
 .done:
     ret
 
@@ -285,5 +299,5 @@ keymap:
 cmd_help db "help", 0
 cmd_clear db "clear", 0
 cmd_conclusion db "conclusion", 0
-
-times 1024-($-$$) db 0
+cmd_ver db "ver", 0
+times 2048-($-$$) db 0
