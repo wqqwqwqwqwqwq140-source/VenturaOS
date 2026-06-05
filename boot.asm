@@ -1,164 +1,347 @@
+; boot.asm - Единый файл загрузчика VenturaOS
+; Сборка: nasm -f bin boot.asm -o boot.bin
+
+; ========== КОНСТАНТЫ ==========
+KERNEL_LBA      equ 5
+KERNEL_SECTORS  equ 128
+BOOT_INFO_ADDR  equ 0x500
+
+; ========== STAGE 1: Boot Sector ==========
 [bits 16]
-[org 0x7c00]
+[org 0x7C00]
 
-; Адрес в оперативке, куда мы скопируем наше ядро (kernel.bin)
-KERNEL_OFFSET equ 0x1000
-
-start:
-    ; Гарантируем правильные адреса сегментов данных
+stage1:
+    cli
     xor ax, ax
     mov ds, ax
     mov es, ax
-    
-    ; Сразу сохраняем номер загрузочного диска, прилетевший от BIOS
+    mov ss, ax
+    mov sp, 0x7C00
+
     mov [boot_drive], dl
 
-    ; 1. Очищаем экран
-    mov ax, 0x0003
-    int 0x10
+    ; Загружаем stage2 (секторы 1-4) по адресу 0x7E00
+    mov si, dap_stage2
+    mov ah, 0x42
+    int 0x13
+    jc disk_error
 
-    ; 2. Выводим наше меню выбора на экран
-    mov si, print1        
-    call .print           
+    jmp 0x0000:0x7E00
 
-.menu_loop:
-    ; 3. Опрос клавиатуры (ждем реакцию пользователя)
-    mov ah, 0x00
-    int 0x16              ; Код кнопки летит в AL
+disk_error:
+    mov si, msg_disk_error
+    call print_string_16
+    cli
+    hlt
 
-    ; 4. Проверяем, что нажал пользователь
-    cmp al, '1'           ; Нажали символ '1'? (Восстановление)
-    je .recovery
-
-    cmp al, '2'           ; Нажали символ '2'? (Система / GUI)
-    je .13hmode
-
-    jmp .menu_loop        ; Если нажали любой другой мусор — игнорируем и ждем дальше
-
-
-; --- ВЕТКИ НАСТРОЙКИ РЕЖИМОВ ---
-
-.recovery:
-    mov bh, 1             ; Наш секретный флаг: 1 = Текстовый режим восстановления
-    jmp .read_disk        
-
-.13hmode:
-    ; Переключаем видеокарту в графический режим 13h (320x200, 256 цветов)
-    mov ah, 0x00
-    mov al, 0x13
-    int 0x10
-
-    mov bh, 2             ; Наш секретный флаг: 2 = Графический режим GUI
-    jmp .read_disk        
-
-
-; --- ЧТЕНИЕ ЯДРА С ДИСКА ---
-
-.read_disk:
-    mov bx, KERNEL_OFFSET ; Куда складывать байты ядра
-    mov dh, 2             ; Сколько секторов диска считать (2 сектора = 1024 байта)
-    mov ah, 0x02          ; Функция BIOS: чтение с диска
-    mov al, dh
-    mov ch, 0             ; Цилиндр 0
-    mov dh, 0             ; Головка 0
-    mov cl, 2             ; Начать со 2-го сектора (первый сектор занят этим boot.asm)
-    
-    mov dl, [boot_drive]  ; Передаем BIOS правильный номер нашего диска
-    int 0x13              
-    
-    jc .read_error        ; Если флаг переноса поднялся — чтение сломалось, уходим на обработку
-    jmp .go_to_32bit      ; Если всё ок — уходим на процедуру включения 32-битного режима
-
-.read_error:
-    ; В случае ошибки сбрасываем видеорежим в текстовый и перезапускаем меню
-    mov ax, 0x0003
-    int 0x10
-    jmp start
-
-
-; --- ПЕРЕХОД В ЗАЩИЩЕННЫЙ РЕЖИМ ---
-
-.go_to_32bit:
-    cli                   ; Выключаем прерывания BIOS
-
-    lgdt [gdt_descriptor] ; Загружаем таблицу GDT в процессор
-
-    ; Включение 32-битного режима в регистре CR0
-    mov eax, cr0
-    or eax, 1
-    mov cr0, eax
-
-    ; Тот самый FAR JUMP. Очищаем конвейер и прыгаем в 32 бита!
-    jmp 0x08:init_32bit
-
-
-; --- ПОДФУНКЦИЯ ПЕЧАТИ (16 бит) ---
-
-.print:
+print_string_16:
     lodsb
-    test al, al
-    jz .done              
-    mov ah, 0x0e          
-    int 0x10              
-    jmp .print            
+    or al, al
+    jz .done
+    mov ah, 0x0E
+    int 0x10
+    jmp print_string_16
 .done:
     ret
 
+dap_stage2:
+    db 0x10
+    db 0
+    dw 4              ; 4 сектора для stage2
+    dw 0x7E00
+    dw 0x0000
+    dq 1
 
-; =============================================================================
-; 32-БИТНЫЙ БЛОК (Сюда мы прилетаем после FAR JUMP)
-; =============================================================================
-[bits 32]
-init_32bit:
-    ; Настраиваем сегментные регистры для 32-битного режима
-    mov ax, 0x10        
+msg_disk_error db "Disk error!", 0
+boot_drive db 0
+
+times 510 - ($ - $$) db 0
+dw 0xAA55
+
+; ========== STAGE 2 ==========
+; Начинается сразу после boot sector (физический адрес 0x7E00)
+; Используем absolute адресацию вместо org
+
+[bits 16]
+section stage2 vstart=0x7E00
+
+stage2_start:
+    xor ax, ax
     mov ds, ax
+    mov es, ax
     mov ss, ax
+    mov sp, 0x7C00
+
+    ; Устанавливаем VBE режим
+    call vbe_set_mode
+
+    ; Загружаем ядро
+    call load_kernel
+
+    ; Переходим в 64-битный режим
+    jmp enter_long_mode
+
+    cli
+    hlt
+
+; ---------- Загрузка ядра ----------
+load_kernel:
+    mov si, dap_kernel
+    mov dl, [boot_drive]
+    mov ah, 0x42
+    int 0x13
+    jc .error
+    ret
+.error:
+    mov si, msg_kernel_err
+    call print_string_16
+    cli
+    hlt
+
+dap_kernel:
+    db 0x10
+    db 0
+    dw KERNEL_SECTORS
+    dw 0x1000
+    dw 0x0000
+    dq KERNEL_LBA
+
+msg_kernel_err db "Kernel load error!", 0
+
+; ---------- VBE установка режима ----------
+vbe_set_mode:
+    push es
+    push ds
+
+    mov ax, 0x4F00
+    mov di, 0x8000
+    int 0x10
+    cmp ax, 0x004F
+    jne .no_vbe
+
+    les si, [di + 0x0E]
+    push es
+    pop ds
+
+    mov word [vbe_mode], 0xFFFF
+
+.search_1920:
+    mov cx, [si]
+    cmp cx, 0xFFFF
+    je .fallback_1024
+    add si, 2
+
+    push ds
+    pop es
+    mov di, 0x8200
+    mov ax, 0x4F01
+    int 0x10
+    cmp ax, 0x004F
+    jne .search_1920
+
+    test byte [di], 0x90
+    jz .search_1920
+
+    cmp word [di + 0x12], 1920
+    jne .search_1920
+    cmp word [di + 0x14], 1200
+    jne .search_1920
+    cmp byte [di + 0x19], 32
+    jne .search_1920
+
+    mov [vbe_mode], cx
+    jmp .found
+
+.fallback_1024:
+    les si, [0x8000 + 0x0E]
+    push es
+    pop ds
+.fb1024_loop:
+    mov cx, [si]
+    cmp cx, 0xFFFF
+    je .fallback_any
+    add si, 2
+
+    push ds
+    pop es
+    mov di, 0x8200
+    mov ax, 0x4F01
+    int 0x10
+    cmp ax, 0x004F
+    jne .fb1024_loop
+
+    test byte [di], 0x90
+    jz .fb1024_loop
+
+    cmp word [di + 0x12], 1024
+    jne .fb1024_loop
+    cmp word [di + 0x14], 768
+    jne .fb1024_loop
+    cmp byte [di + 0x19], 32
+    jne .fb1024_loop
+
+    mov [vbe_mode], cx
+    jmp .found
+
+.fallback_any:
+    les si, [0x8000 + 0x0E]
+    push es
+    pop ds
+.any_loop:
+    mov cx, [si]
+    cmp cx, 0xFFFF
+    je .no_vbe
+    add si, 2
+
+    push ds
+    pop es
+    mov di, 0x8200
+    mov ax, 0x4F01
+    int 0x10
+    cmp ax, 0x004F
+    jne .any_loop
+
+    test byte [di], 0x90
+    jz .any_loop
+    cmp byte [di + 0x19], 32
+    jne .any_loop
+
+    mov [vbe_mode], cx
+    jmp .found
+
+.no_vbe:
+    mov si, msg_vbe
+    call print_string_16
+    cli
+    hlt
+
+.found:
+    mov ax, 0x4F02
+    mov bx, [vbe_mode]
+    or bx, 0x4000
+    int 0x10
+
+    ; Заполняем boot_info
+    mov di, BOOT_INFO_ADDR
+    mov dword [di], 0xB0071E55
+    mov ax, [0x8200 + 0x12]
+    mov [di + 4], ax
+    mov ax, [0x8200 + 0x14]
+    mov [di + 6], ax
+    mov al, [0x8200 + 0x19]
+    mov [di + 8], al
+    mov ax, [0x8200 + 0x10]
+    mov [di + 10], ax
+    mov eax, [0x8200 + 0x28]
+    mov [di + 12], eax
+    mov dword [di + 16], 0
+
+    pop ds
+    pop es
+    ret
+
+vbe_mode dw 0
+msg_vbe db "VBE not found!", 0
+
+; ---------- Переход в Long Mode ----------
+enter_long_mode:
+    cli
+
+    ; Включаем A20
+    in al, 0x92
+    or al, 2
+    out 0x92, al
+
+    ; Загружаем GDT
+    lgdt [gdtr]
+
+    ; Переходим в защищенный режим
+    mov eax, cr0
+    or al, 1
+    mov cr0, eax
+
+    jmp 0x08:protected_mode_32
+
+[bits 32]
+protected_mode_32:
+    mov ax, 0x10
+    mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
+    mov ss, ax
+    mov esp, 0x90000
 
-    ; Настраиваем стек
-    mov ebp, 0x90000
-    mov esp, ebp
+    ; Очистка страничных таблиц (16 КБ)
+    mov edi, 0x100000
+    mov ecx, 0x4000
+    xor eax, eax
+    rep stosd
 
-    ; ПРЫГАЕМ ПРЯМО В НАЧАЛО ТВОЕГО ЯДРА (KERNEL)
-    jmp KERNEL_OFFSET
+    ; PML4[0] -> PDPT
+    mov dword [0x100000], 0x101003
+    ; PDPT[0] -> PD
+    mov dword [0x101000], 0x102003
 
+    ; PD: 512 записей по 2MB (первые 1 ГБ)
+    mov edi, 0x102000
+    mov eax, 0x000083
+    mov ecx, 512
+.fill_pd:
+    mov [edi], eax
+    add edi, 8
+    add eax, 0x200000
+    loop .fill_pd
 
-; =============================================================================
-; ТАБЛИЦА GDT и ДАННЫЕ
-; =============================================================================
+    ; Включаем PAE
+    mov eax, cr4
+    or eax, 1 << 5
+    mov cr4, eax
 
-gdt_start:
-    dd 0x0          ; Нулевой дескриптор
-    dd 0x0
+    ; Включаем Long Mode в EFER
+    mov ecx, 0xC0000080
+    rdmsr
+    or eax, 1 << 8
+    wrmsr
 
-gdt_code:           ; Сегмент кода
-    dw 0xffff       
-    dw 0x0          
-    db 0x0          
-    db 10011010b    
-    db 11001111b    
-    db 0x0          
+    ; Загружаем CR3
+    mov eax, 0x100000
+    mov cr3, eax
 
-gdt_data:           ; Сегмент данных
-    dw 0xffff       
-    dw 0x0          
-    db 0x0          
-    db 10010010b    
-    db 11001111b    
-    db 0x0          
-gdt_end:
+    ; Включаем пейджинг
+    mov eax, cr0
+    or eax, 0x80000000
+    mov cr0, eax
 
-gdt_descriptor:
-    dw gdt_end - gdt_start - 1 
-    dd gdt_start               
+    ; Прыгаем в 64-битный код
+    jmp 0x18:long_mode_64
 
-; Данные загрузчика
-boot_drive db 0           ; Переменная для хранения номера диска
-print1 db "1 - load recovery", 13, 10, "2 - load System (GUI)", 13, 10, 0
+[bits 64]
+long_mode_64:
+    mov ax, 0x20
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    mov rsp, 0x90000
 
-; Добиваем до 512 байт сигнатурой загрузчика
-times 510-($-$$) db 0
-dw 0xaa55
+    ; Передаем указатель на boot_info в RDI
+    mov rdi, BOOT_INFO_ADDR
+    
+    ; Прыгаем на ядро (0x1000)
+    mov rax, 0x1000
+    jmp rax
+
+; ---------- GDT (должна быть выровнена) ----------
+align 8
+gdt:
+    dq 0x0000000000000000  ; NULL дескриптор
+    dq 0x00CF9A000000FFFF  ; 32-bit код (селектор 0x08)
+    dq 0x00CF92000000FFFF  ; 32-bit данные (селектор 0x10)
+    dq 0x00209A0000000000  ; 64-bit код (селектор 0x18)
+    dq 0x0000920000000000  ; 64-bit данные (селектор 0x20)
+
+gdtr:
+    dw $ - gdt - 1
+    dd gdt
